@@ -30,7 +30,7 @@ class VDN:
             path_vdn = self.model_dir + '/vdn_net_params.pkl'
             self.eval_rnn.load_state_dict(torch.load(path_rnn))
             self.eval_vdn_net.load_state_dict(torch.load(path_vdn))
-            print('Successfully load the rnn model {} and the vdn model {}'.format(path_rnn, path_vdn))
+            print('Successfully load the model: {} and {}'.format(path_rnn, path_vdn))
 
         # 让target_net和eval_net的网络参数相同
         self.target_rnn.load_state_dict(self.eval_rnn.state_dict())
@@ -103,8 +103,8 @@ class VDN:
         inputs, inputs_next = [], []
         inputs.append(obs)
         inputs_next.append(obs_next)
-        # 给obs添加上一个动作、agent编号
 
+        # 给obs添加上一个动作、agent编号
         if self.args.last_action:
             if transition_idx == 0:  # 如果是第一条经验，就让前一个动作为0向量
                 inputs.append(torch.zeros_like(u_onehot[:, transition_idx]))
