@@ -1,6 +1,8 @@
 import torch
 import os
-from network.rnn import RNN
+from network.base_net import RNN
+from network.commnet import CommNet
+from network.g2anet import G2ANet
 from network.coma_critic import ComaCritic
 from common.utils import td_lambda_target
 
@@ -22,20 +24,35 @@ class COMA:
 
         # 神经网络
         # 每个agent选动作的网络,输出当前agent所有动作对应的概率，用该概率选动作的时候还需要用softmax再运算一次。
-        self.eval_rnn = RNN(actor_input_shape, args)
+        if self.args.alg == 'coma':
+            print('Init alg coma')
+            self.eval_rnn = RNN(actor_input_shape, args)
+        elif self.args.alg == 'coma+commnet':
+            print('Init alg coma+commnet')
+            self.eval_rnn = CommNet(actor_input_shape, args)
+        elif self.args.alg == 'coma+g2anet':
+            print('Init alg coma+g2anet')
+            self.eval_rnn = G2ANet(actor_input_shape, args)
+        else:
+            raise Exception("No such algorithm")
 
         # 得到当前agent的所有可执行动作对应的联合Q值，得到之后需要用该Q值和actor网络输出的概率计算advantage
         self.eval_critic = ComaCritic(critic_input_shape, self.args)
         self.target_critic = ComaCritic(critic_input_shape, self.args)
 
+        if self.args.cuda:
+            self.eval_rnn.cuda()
+            self.eval_critic.cuda()
+            self.target_critic.cuda()
+
         self.model_dir = args.model_dir + '/' + args.alg + '/' + args.map
         # 如果存在模型则加载模型
-        if os.path.exists(self.model_dir + '/rnn_params.pkl'):
-            path_rnn = self.model_dir + '/rnn_params.pkl'
-            path_coma = self.model_dir + '/critic_params.pkl'
-            self.eval_rnn.load_state_dict(torch.load(path_rnn))
-            self.eval_critic.load_state_dict(torch.load(path_coma))
-            print('Successfully load the model: {} and {}'.format(path_rnn, path_coma))
+        # if os.path.exists(self.model_dir + '/rnn_params.pkl'):
+        #     path_rnn = self.model_dir + '/rnn_params.pkl'
+        #     path_coma = self.model_dir + '/critic_params.pkl'
+        #     self.eval_rnn.load_state_dict(torch.load(path_rnn))
+        #     self.eval_critic.load_state_dict(torch.load(path_coma))
+        #     print('Successfully load the model: {} and {}'.format(path_rnn, path_coma))
 
         # 让target_net和eval_net的网络参数相同
         self.target_critic.load_state_dict(self.eval_critic.state_dict())
@@ -74,7 +91,9 @@ class COMA:
                 batch[key] = torch.tensor(batch[key], dtype=torch.float32)
         u, r, avail_u, terminated = batch['u'], batch['r'],  batch['avail_u'], batch['terminated']
         mask = (1 - batch["padded"].float()).repeat(1, 1, self.n_agents)  # 用来把那些填充的经验的TD-error置0，从而不让它们影响到学习
-
+        if self.args.cuda:
+            u = u.cuda()
+            mask = mask.cuda()
         # 根据经验计算每个agent的Ｑ值,从而跟新Critic网络。然后计算各个动作执行的概率，从而计算advantage去更新Actor。
         q_values = self._train_critic(batch, max_episode_len, train_step)  # 训练critic网络，并且得到每个agent的所有动作的Ｑ值
         action_prob = self._get_action_prob(batch, max_episode_len, epsilon)  # 每个agent的所有动作的概率
@@ -101,15 +120,15 @@ class COMA:
         # for params in self.eval_rnn.named_parameters():
         #     print(params)
 
-    def _get_critic_inputs(self, batch, transition_idx):
+    def _get_critic_inputs(self, batch, transition_idx, max_episode_len):
         # 取出所有episode上该transition_idx的经验
         obs, obs_next, s, s_next = batch['o'][:, transition_idx], batch['o_next'][:, transition_idx],\
                                    batch['s'][:, transition_idx], batch['s_next'][:, transition_idx]
-        # TODO buffer里没有存u_onehot_next、u_next
         u_onehot = batch['u_onehot'][:, transition_idx]
-        u_onehot_next = u_onehot[:, 1:]
-        padded_u_next = torch.zeros(*u_onehot[:, -1].shape).unsqueeze(1)
-        u_onehot_next = torch.cat((u_onehot_next, padded_u_next), dim=1)
+        if transition_idx != max_episode_len - 1:
+            u_onehot_next = batch['u_onehot'][:, transition_idx + 1]
+        else:
+            u_onehot_next = torch.zeros(*u_onehot.shape)
         # s和s_next是二维的，没有n_agents维度，因为所有agent的s一样。其他都是三维的，到时候不能拼接，所以要把s转化成三维的
         s = s.unsqueeze(1).expand(-1, self.n_agents, -1)
         s_next = s_next.unsqueeze(1).expand(-1, self.n_agents, -1)
@@ -164,10 +183,13 @@ class COMA:
         episode_num = batch['o'].shape[0]
         q_evals, q_targets = [], []
         for transition_idx in range(max_episode_len):
-            inputs, inputs_next = self._get_critic_inputs(batch, transition_idx)
+            inputs, inputs_next = self._get_critic_inputs(batch, transition_idx, max_episode_len)
+            if self.args.cuda:
+                inputs = inputs.cuda()
+                inputs_next = inputs_next.cuda()
             # 神经网络输入的是(episode_num * n_agents, inputs)二维数据，得到的是(episode_num * n_agents， n_actions)二维数据
-            q_eval = self.eval_critic.forward(inputs)
-            q_target = self.target_critic.forward(inputs_next)
+            q_eval = self.eval_critic(inputs)
+            q_target = self.target_critic(inputs_next)
 
             # 把q值的维度重新变回(episode_num, n_agents, n_actions)
             q_eval = q_eval.view(episode_num, self.n_agents, -1)
@@ -210,14 +232,17 @@ class COMA:
         action_prob = []
         for transition_idx in range(max_episode_len):
             inputs = self._get_actor_inputs(batch, transition_idx)  # 给obs加last_action、agent_id
-            outputs, self.eval_hidden = self.eval_rnn.forward(inputs, self.eval_hidden)  # inputs维度为(40,96)，得到的q_eval维度为(40,n_actions)
+            if self.args.cuda:
+                inputs = inputs.cuda()
+                self.eval_hidden = self.eval_hidden.cuda()
+            outputs, self.eval_hidden = self.eval_rnn(inputs, self.eval_hidden)  # inputs维度为(40,96)，得到的q_eval维度为(40,n_actions)
             # 把q_eval维度重新变回(8, 5,n_actions)
             outputs = outputs.view(episode_num, self.n_agents, -1)
             prob = torch.nn.functional.softmax(outputs, dim=-1)
             action_prob.append(prob)
         # 得的action_prob是一个列表，列表里装着max_episode_len个数组，数组的的维度是(episode个数, n_agents，n_actions)
         # 把该列表转化成(episode个数, max_episode_len， n_agents，n_actions)的数组
-        action_prob = torch.stack(action_prob, dim=1)
+        action_prob = torch.stack(action_prob, dim=1).cpu()
 
         action_num = avail_actions.sum(dim=-1, keepdim=True).float().repeat(1, 1, 1, avail_actions.shape[-1])   # 可以选择的动作的个数
         action_prob = ((1 - epsilon) * action_prob + torch.ones_like(action_prob) * epsilon / action_num)
@@ -228,6 +253,8 @@ class COMA:
         # 因为有许多经验是填充的，它们的avail_actions都填充的是0，所以该经验上所有动作的概率都为0，在正则化的时候会得到nan。
         # 因此需要再一次将该经验对应的概率置为0
         action_prob[avail_actions == 0] = 0.0
+        if self.args.cuda:
+            action_prob = action_prob.cuda()
         return action_prob
 
     def init_hidden(self, episode_num):
@@ -240,6 +267,10 @@ class COMA:
         padded_u_next = torch.zeros(*u[:, -1].shape, dtype=torch.long).unsqueeze(1)
         u_next = torch.cat((u_next, padded_u_next), dim=1)
         mask = (1 - batch["padded"].float()).repeat(1, 1, self.n_agents)  # 用来把那些填充的经验的TD-error置0，从而不让它们影响到学习
+        if self.args.cuda:
+            u = u.cuda()
+            u_next = u_next.cuda()
+            mask = mask.cuda()
         # 得到每个agent对应的Q值，维度为(episode个数, max_episode_len， n_agents，n_actions)
         # q_next_target为下一个状态-动作对应的target网络输出的Q值，没有包括reward
         q_evals, q_next_target = self._get_q_values(batch, max_episode_len)
@@ -248,8 +279,9 @@ class COMA:
 
         q_evals = torch.gather(q_evals, dim=3, index=u).squeeze(3)
         q_next_target = torch.gather(q_next_target, dim=3, index=u_next).squeeze(3)
-        targets = td_lambda_target(batch, max_episode_len, q_next_target, self.args)
-
+        targets = td_lambda_target(batch, max_episode_len, q_next_target.cpu(), self.args)
+        if self.args.cuda:
+            targets = targets.cuda()
         td_error = targets.detach() - q_evals
         masked_td_error = mask * td_error  # 抹掉填充的经验的td_error
 

@@ -1,10 +1,10 @@
 import numpy as np
 import os
-from common.rollout import RolloutWorker, CommNetRolloutWorker
-from agent.agent import Agents, CommNetAgents
+from common.rollout import RolloutWorker, CommRolloutWorker
+from agent.agent import Agents, CommAgents
 from common.replay_buffer import ReplayBuffer
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+# from tqdm import tqdm
 from smac.env import StarCraft2Env
 
 
@@ -22,15 +22,15 @@ class Runner:
                                           reward_sparse=True,
                                           reward_scale=False)
 
-        if args.alg == 'commnet_coma':
-            self.agents = CommNetAgents(args)
-            self.rolloutWorker = CommNetRolloutWorker(env, self.agents, args)
-            self.evaluateWorker = CommNetRolloutWorker(self.env_evaluate, self.agents, args)
-        else:
+        if args.alg.find('commnet') > -1 or args.alg.find('g2anet') > -1:  # communication
+            self.agents = CommAgents(args)
+            self.rolloutWorker = CommRolloutWorker(env, self.agents, args)
+            self.evaluateWorker = CommRolloutWorker(self.env_evaluate, self.agents, args)
+        else:  # no communication
             self.agents = Agents(args)
             self.rolloutWorker = RolloutWorker(env, self.agents, args)
             self.evaluateWorker = RolloutWorker(self.env_evaluate, self.agents, args)
-        if args.alg != 'coma' and args.alg != 'commnet_coma':
+        if args.alg.find('coma') == -1 and args.alg.find('central_v') == -1 and args.alg.find('reinforce') == -1:  # these 3 algorithm are on-poliy
             self.buffer = ReplayBuffer(args)
         self.args = args
 
@@ -39,27 +39,28 @@ class Runner:
         if not os.path.exists(self.save_path):
             os.makedirs(self.save_path)
 
-    def run(self):
+    def run(self, num):
         plt.figure()
         plt.axis([0, self.args.n_epoch, 0, 100])
         win_rates = []
         episode_rewards = []
         train_steps = 0
-        for epoch in tqdm(range(self.args.n_epoch)):
-            # print('Train epoch {} start'.format(epoch))
+        # print('Run {} start'.format(num))
+        for epoch in range(self.args.n_epoch):
+            print('Run {}, train epoch {}'.format(num, epoch))
             episodes = []
             # 收集self.args.n_episodes个episodes
             for episode_idx in range(self.args.n_episodes):
-                episode, _ = self.rolloutWorker.generate_episode()
+                episode, _ = self.rolloutWorker.generate_episode(episode_idx)
                 episodes.append(episode)
-                print(_)
+                # print(_)
             # episode的每一项都是一个(1, episode_len, n_agents, 具体维度)四维数组，下面要把所有episode的的obs拼在一起
             episode_batch = episodes[0]
             episodes.pop(0)
             for episode in episodes:
                 for key in episode_batch.keys():
                     episode_batch[key] = np.concatenate((episode_batch[key], episode[key]), axis=0)
-            if self.args.alg == 'coma' or self.args.alg == 'commnet_coma':
+            if self.args.alg.find('coma') > -1 or self.args.alg.find('central_v') > -1 or self.args.alg.find('reinforce') > -1:
                 self.agents.train(episode_batch, train_steps, self.rolloutWorker.epsilon)
                 train_steps += 1
             else:
@@ -68,32 +69,30 @@ class Runner:
                     mini_batch = self.buffer.sample(min(self.buffer.current_size, self.args.batch_size))
                     self.agents.train(mini_batch, train_steps)
                     train_steps += 1
-            # if epoch > 0 and epoch % 5 == 0:
-            win_rate, episode_reward = self.evaluate()
-            # print('win_rate is ', win_rate)
-            win_rates.append(win_rate)
-            episode_rewards.append(episode_reward)
-            # 可视化
-            if epoch % 20 == 0:
+            if epoch % self.args.evaluate_cycle == 0:
+                win_rate, episode_reward = self.evaluate()
+                # print('win_rate is ', win_rate)
+                win_rates.append(win_rate)
+                episode_rewards.append(episode_reward)
                 plt.cla()
                 plt.subplot(2, 1, 1)
                 plt.plot(range(len(win_rates)), win_rates)
-                plt.xlabel('epoch * 5')
+                plt.xlabel('epoch')
                 plt.ylabel('win_rate')
 
                 plt.subplot(2, 1, 2)
                 plt.plot(range(len(episode_rewards)), episode_rewards)
-                plt.xlabel('epoch * 5')
+                plt.xlabel('epoch')
                 plt.ylabel('episode_rewards')
 
-                plt.savefig(self.save_path + '/plt.png', format='png')
-                np.save(self.save_path + '/win_rates', win_rates)
-                np.save(self.save_path + '/episode_rewards', episode_rewards)
+                plt.savefig(self.save_path + '/plt_{}.png'.format(num), format='png')
+                np.save(self.save_path + '/win_rates_{}'.format(num), win_rates)
+                np.save(self.save_path + '/episode_rewards_{}'.format(num), episode_rewards)
 
         plt.cla()
         plt.subplot(2, 1, 1)
         plt.plot(range(len(win_rates)), win_rates)
-        plt.xlabel('epoch * 10')
+        plt.xlabel('epoch')
         plt.ylabel('win_rate')
 
         plt.subplot(2, 1, 2)
@@ -101,9 +100,9 @@ class Runner:
         plt.xlabel('epoch')
         plt.ylabel('episode_rewards')
 
-        plt.savefig(self.save_path + '/plt.png', format='png')
-        np.save(self.save_path + '/win_rates', win_rates)
-        np.save(self.save_path + '/episode_rewards', episode_rewards)
+        plt.savefig(self.save_path + '/plt_{}.png'.format(num), format='png')
+        np.save(self.save_path + '/win_rates_{}'.format(num), win_rates)
+        np.save(self.save_path + '/episode_rewards_{}'.format(num), episode_rewards)
 
     def evaluate(self):
         win_number = 0

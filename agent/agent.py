@@ -3,9 +3,10 @@ import torch
 from policy.vdn import VDN
 from policy.qmix import QMIX
 from policy.coma import COMA
+from policy.reinforce import Reinforce
+from policy.central_v import CentralV
 from policy.qtran_alt import QtranAlt
 from policy.qtran_base import QtranBase
-from policy.commnet_coma import CommNetComa
 from torch.distributions import Categorical
 
 
@@ -25,9 +26,14 @@ class Agents:
             self.policy = QtranAlt(args)
         elif args.alg == 'qtran_base':
             self.policy = QtranBase(args)
+        elif args.alg == 'central_v':
+            self.policy = CentralV(args)
+        elif args.alg == 'reinforce':
+            self.policy = Reinforce(args)
         else:
             raise Exception("No such algorithm")
         self.args = args
+        print('Init Agents')
 
     def choose_action(self, obs, last_action, agent_num, avail_actions, epsilon, evaluate=False):
         inputs = obs.copy()
@@ -35,7 +41,6 @@ class Agents:
         # 传入的agent_num是一个整数，代表第几个agent，现在要把他变成一个onehot向量
         agent_id = np.zeros(self.n_agents)
         agent_id[agent_num] = 1.
-
         if self.args.last_action:
             inputs = np.hstack((inputs, last_action))  # obs是数组，不能append
         if self.args.reuse_network:
@@ -44,9 +49,12 @@ class Agents:
         # 转化成Tensor,inputs的维度是(42,)，要转化成(1,42)
         inputs = torch.tensor(inputs, dtype=torch.float32).unsqueeze(0)
         avail_actions = torch.tensor(avail_actions, dtype=torch.float32).unsqueeze(0)
+        if self.args.cuda:
+            inputs = inputs.cuda()
+            hidden_state = hidden_state.cuda()
         q_value, self.policy.eval_hidden[:, agent_num, :] = self.policy.eval_rnn.forward(inputs, hidden_state)
-        if self.args.alg == 'coma':
-            action = self._choose_coma_action(q_value, avail_actions, epsilon, evaluate)
+        if self.args.alg == 'coma' or self.args.alg == 'crntral_v' or self.args.alg == 'reinforce':
+            action = self._choose_action_from_softmax(q_value.cpu(), avail_actions, epsilon, evaluate)
         else:
             q_value[avail_actions == 0.0] = - float("inf")  # 传入的avail_actions参数是一个array
             if np.random.uniform() < epsilon:
@@ -55,7 +63,7 @@ class Agents:
                 action = torch.argmax(q_value)
         return action
 
-    def _choose_coma_action(self, inputs, avail_actions, epsilon, evaluate=False):  # inputs是所有动作的q值
+    def _choose_action_from_softmax(self, inputs, avail_actions, epsilon, evaluate=False):  # inputs是所有动作的q值
         action_num = avail_actions.sum(dim=1, keepdim=True).float().repeat(1, avail_actions.shape[-1])  # 可以选择的动作的个数
         # 先将Actor网络的输出通过softmax转换成概率分布
         prob = torch.nn.functional.softmax(inputs, dim=-1)
@@ -97,14 +105,23 @@ class Agents:
             self.policy.save_model(train_step)
 
 
-class CommNetAgents:
+class CommAgents:
     def __init__(self, args):
         self.n_actions = args.n_actions
         self.n_agents = args.n_agents
         self.state_shape = args.state_shape
         self.obs_shape = args.obs_shape
-        self.policy = CommNetComa(args)
+        alg = args.alg
+        if alg.find('reinforce') > -1:
+            self.policy = Reinforce(args)
+        elif alg.find('coma') > -1:
+            self.policy = COMA(args)
+        elif alg.find('central_v') > -1:
+            self.policy = CentralV(args)
+        else:
+            raise Exception("No such algorithm")
         self.args = args
+        print('Init CommAgents')
 
     # 根据weights得到概率，然后再根据epsilon选动作
     def choose_action(self, weights, avail_actions, epsilon, evaluate=False):
@@ -140,8 +157,12 @@ class CommNetAgents:
         if self.args.reuse_network:
             inputs.append(torch.eye(self.args.n_agents))
         inputs = torch.cat([x for x in inputs], dim=1)
-        weights, self.policy.eval_hidden = self.policy.eval_rnn.forward(inputs, self.policy.eval_hidden)
-        return weights
+        if self.args.cuda:
+            inputs = inputs.cuda()
+            self.policy.eval_hidden = self.policy.eval_hidden.cuda()
+        weights, self.policy.eval_hidden = self.policy.eval_rnn(inputs, self.policy.eval_hidden)
+        weights = weights.reshape(self.args.n_agents, self.args.n_actions)
+        return weights.cpu()
 
     def _get_max_episode_len(self, batch):
         terminated = batch['terminated']
